@@ -1,31 +1,44 @@
 name: Build Agent
-
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
-
 jobs:
   build:
     runs-on: windows-latest
-    
     steps:
     - uses: actions/checkout@v3
-    
-    - name: Setup Node.js
-      uses: actions/setup-node@v3
+    - uses: actions/setup-node@v3
       with:
         node-version: '18'
-    
-    - name: Install dependencies
-      run: npm install
-    
-    - name: Build executable
-      run: npm run build
-    
-    - name: Upload artifact
-      uses: actions/upload-artifact@v3
+    - run: npm install
+    - run: npm run build
+    - uses: actions/upload-artifact@v3
       with:
         name: AtritelecomAgent
         path: dist/AtritelecomAgent.exe
+```
+
+---
+
+## 🔥 COMO VAI FUNCIONAR:
+```
+Dashboard → API /api/xmeye/snapshot/1?serial=d0d3f2d7b428c1e5
+    ↓
+Render Server (WebSocket)
+    ↓
+Agente Windows (Cliente)
+    ↓
+DVR XMEye (192.168.0.200)
+    ↓
+Captura snapshot → Envia base64
+    ↓
+Render → Dashboard exibe imagem!
+```
+
+---
+
+## 📝 DEPOIS DE SUBIR:
+
+### **Testar API:**
+```
+GET https://seu-render.onrender.com/api/xmeye/snapshot/1?serial=d0d3f2d7b428c1e5&user=admin&pass=&channel=0
