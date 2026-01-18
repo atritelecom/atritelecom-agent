@@ -1,303 +1,446 @@
 const WebSocket = require('ws');
 const os = require('os');
+const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
 
-// ========== CONFIGURAÇÃO ==========
-const CONFIG_FILE = path.join(process.env.APPDATA || '.', 'AtritelecomAgent', 'config.json');
-const LOG_FILE = path.join(process.env.APPDATA || '.', 'AtritelecomAgent', 'agent.log');
+// Configuração
+const CONFIG_FILE = path.join(process.env.APPDATA || process.env.HOME, 'AtritelecomAgent', 'config.json');
 const SERVER_URL = 'wss://saas-websocket.onrender.com';
 
-let config = {
-    cliente_id: '',
-    server_url: SERVER_URL
-};
-
 let ws = null;
-let reconnectInterval = null;
-let pingInterval = null;
+let clienteId = null;
+let cameras = [];
+let dispositivos = [];
+let snapshotIntervals = {};
 
-// ========== LOGGING ==========
-function log(message) {
-    const timestamp = new Date().toISOString();
-    const logMessage = `[${timestamp}] ${message}`;
-    console.log(logMessage);
-    
-    try {
-        const dir = path.dirname(LOG_FILE);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-        fs.appendFileSync(LOG_FILE, logMessage + '\n');
-    } catch (e) {}
-}
-
-// ========== CONFIGURAÇÃO ==========
+// Carregar configuração
 function loadConfig() {
     try {
         if (fs.existsSync(CONFIG_FILE)) {
-            const data = fs.readFileSync(CONFIG_FILE, 'utf8');
-            config = { ...config, ...JSON.parse(data) };
-            log(`Configuração carregada: cliente_id = ${config.cliente_id}`);
+            const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+            clienteId = config.cliente_id;
+            cameras = config.cameras || [];
+            dispositivos = config.dispositivos || [];
+            return true;
         }
     } catch (e) {
-        log(`Erro ao carregar config: ${e.message}`);
+        console.error('Erro ao carregar config:', e.message);
     }
+    return false;
 }
 
+// Salvar configuração
 function saveConfig() {
     try {
         const dir = path.dirname(CONFIG_FILE);
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
-        fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
-        log('Configuração salva');
+        fs.writeFileSync(CONFIG_FILE, JSON.stringify({
+            cliente_id: clienteId,
+            cameras: cameras,
+            dispositivos: dispositivos
+        }, null, 2));
     } catch (e) {
-        log(`Erro ao salvar config: ${e.message}`);
+        console.error('Erro ao salvar config:', e.message);
     }
 }
 
-// ========== INFORMAÇÕES DO SISTEMA ==========
+// Obter informações do sistema
 function getSystemInfo() {
+    const networkInterfaces = os.networkInterfaces();
+    let ip = '127.0.0.1';
+    let mac = '00:00:00:00:00:00';
+
+    for (const name of Object.keys(networkInterfaces)) {
+        for (const net of networkInterfaces[name]) {
+            if (net.family === 'IPv4' && !net.internal) {
+                ip = net.address;
+                mac = net.mac;
+                break;
+            }
+        }
+    }
+
     return {
         hostname: os.hostname(),
         platform: os.platform(),
         arch: os.arch(),
+        release: os.release(),
+        ip_local: ip,
+        mac: mac,
+        uptime: os.uptime(),
+        memoria_total: Math.round(os.totalmem() / 1024 / 1024 / 1024 * 100) / 100,
+        memoria_livre: Math.round(os.freemem() / 1024 / 1024 / 1024 * 100) / 100,
         cpus: os.cpus().length,
-        memory_total: Math.round(os.totalmem() / 1024 / 1024 / 1024 * 100) / 100 + ' GB',
-        memory_free: Math.round(os.freemem() / 1024 / 1024 / 1024 * 100) / 100 + ' GB',
-        uptime: Math.round(os.uptime() / 3600 * 100) / 100 + ' horas',
-        network: getNetworkInfo(),
-        timestamp: Date.now()
+        cameras_count: cameras.length,
+        dispositivos_count: dispositivos.length
     };
 }
 
-function getNetworkInfo() {
-    const interfaces = os.networkInterfaces();
-    const result = [];
-    
-    for (const [name, addrs] of Object.entries(interfaces)) {
-        for (const addr of addrs) {
-            if (addr.family === 'IPv4' && !addr.internal) {
-                result.push({
-                    interface: name,
-                    ip: addr.address,
-                    mac: addr.mac
-                });
+// Capturar snapshot da câmera
+function captureSnapshot(camera) {
+    return new Promise((resolve, reject) => {
+        // URLs possíveis para Intelbras
+        const urls = [
+            `http://${camera.usuario}:${camera.senha}@${camera.ip}/cgi-bin/snapshot.cgi`,
+            `http://${camera.usuario}:${camera.senha}@${camera.ip}/ISAPI/Streaming/channels/101/picture`,
+            `http://${camera.usuario}:${camera.senha}@${camera.ip}/Streaming/channels/1/picture`,
+            `http://${camera.ip}/cgi-bin/snapshot.cgi?loginuse=${camera.usuario}&loginpas=${camera.senha}`
+        ];
+
+        let urlIndex = camera.urlIndex || 0;
+        
+        function tryUrl(index) {
+            if (index >= urls.length) {
+                reject(new Error('Todas as URLs falharam'));
+                return;
             }
+
+            const url = urls[index];
+            console.log(`[CAM ${camera.nome}] Tentando URL ${index + 1}/${urls.length}`);
+
+            const req = http.get(url, { timeout: 10000 }, (res) => {
+                if (res.statusCode === 200) {
+                    const chunks = [];
+                    res.on('data', chunk => chunks.push(chunk));
+                    res.on('end', () => {
+                        const buffer = Buffer.concat(chunks);
+                        if (buffer.length > 1000) { // Imagem válida
+                            camera.urlIndex = index; // Salva URL que funcionou
+                            resolve({
+                                camera_id: camera.id,
+                                nome: camera.nome,
+                                timestamp: Date.now(),
+                                image: buffer.toString('base64'),
+                                content_type: res.headers['content-type'] || 'image/jpeg'
+                            });
+                        } else {
+                            tryUrl(index + 1);
+                        }
+                    });
+                } else if (res.statusCode === 401) {
+                    console.log(`[CAM ${camera.nome}] Autenticação falhou na URL ${index + 1}`);
+                    tryUrl(index + 1);
+                } else {
+                    tryUrl(index + 1);
+                }
+            });
+
+            req.on('error', () => tryUrl(index + 1));
+            req.on('timeout', () => {
+                req.destroy();
+                tryUrl(index + 1);
+            });
         }
-    }
-    
-    return result;
+
+        tryUrl(urlIndex);
+    });
 }
 
-// ========== WEBSOCKET ==========
-function connect() {
-    if (!config.cliente_id) {
-        log('ERRO: cliente_id não configurado!');
-        return;
-    }
-    
-    log(`Conectando ao servidor: ${config.server_url}`);
-    
+// Iniciar captura de snapshots
+function startSnapshotCapture() {
+    // Parar capturas anteriores
+    Object.values(snapshotIntervals).forEach(interval => clearInterval(interval));
+    snapshotIntervals = {};
+
+    cameras.forEach(camera => {
+        if (!camera.ativo) return;
+
+        console.log(`[CAM] Iniciando captura: ${camera.nome} (${camera.ip})`);
+        
+        // Captura inicial
+        captureAndSend(camera);
+
+        // Captura periódica (a cada 3 segundos)
+        snapshotIntervals[camera.id] = setInterval(() => {
+            captureAndSend(camera);
+        }, 3000);
+    });
+}
+
+// Capturar e enviar snapshot
+async function captureAndSend(camera) {
     try {
-        ws = new WebSocket(config.server_url);
-        
-        ws.on('open', () => {
-            log('Conectado ao servidor!');
-            
-            // Autenticar
-            const authMessage = {
-                action: 'auth',
-                cliente_id: config.cliente_id,
-                info: getSystemInfo()
-            };
-            
-            ws.send(JSON.stringify(authMessage));
-            log('Autenticação enviada');
-            
-            // Iniciar ping periódico
-            if (pingInterval) clearInterval(pingInterval);
-            pingInterval = setInterval(sendStatusUpdate, 30000); // A cada 30 segundos
-        });
-        
-        ws.on('message', (data) => {
-            try {
-                const message = JSON.parse(data);
-                log(`Mensagem recebida: ${message.action || message.type || 'unknown'}`);
-                handleMessage(message);
-            } catch (e) {
-                log(`Erro ao processar mensagem: ${e.message}`);
-            }
-        });
-        
-        ws.on('close', () => {
-            log('Desconectado do servidor');
-            scheduleReconnect();
-        });
-        
-        ws.on('error', (error) => {
-            log(`Erro WebSocket: ${error.message}`);
-        });
-        
+        const snapshot = await captureSnapshot(camera);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                action: 'camera_snapshot',
+                cliente_id: clienteId,
+                ...snapshot
+            }));
+            console.log(`[CAM ${camera.nome}] Snapshot enviado (${Math.round(snapshot.image.length / 1024)}KB)`);
+        }
     } catch (e) {
-        log(`Erro ao conectar: ${e.message}`);
-        scheduleReconnect();
+        console.error(`[CAM ${camera.nome}] Erro:`, e.message);
     }
 }
 
-function scheduleReconnect() {
-    if (reconnectInterval) return;
-    
-    log('Reconectando em 10 segundos...');
-    reconnectInterval = setTimeout(() => {
-        reconnectInterval = null;
-        connect();
-    }, 10000);
+// Controlar dispositivo Sonoff/IoT
+function controlDevice(dispositivo, comando) {
+    return new Promise((resolve, reject) => {
+        let url = '';
+        
+        // Monta URL baseado no tipo
+        switch (dispositivo.tipo?.toLowerCase()) {
+            case 'sonoff':
+            case 'tasmota':
+                // Tasmota/Sonoff
+                const cmd = comando === 'on' ? 'Power%20On' : 'Power%20Off';
+                url = `http://${dispositivo.ip}/cm?cmnd=${cmd}`;
+                if (dispositivo.usuario && dispositivo.senha) {
+                    url = `http://${dispositivo.usuario}:${dispositivo.senha}@${dispositivo.ip}/cm?cmnd=${cmd}`;
+                }
+                break;
+            case 'shelly':
+                // Shelly
+                const state = comando === 'on' ? 'on' : 'off';
+                url = `http://${dispositivo.ip}/relay/0?turn=${state}`;
+                break;
+            case 'tuya':
+                // Tuya local precisa de protocolo específico
+                reject(new Error('Tuya requer integração específica'));
+                return;
+            default:
+                // Genérico - tenta como Tasmota
+                const cmdGen = comando === 'on' ? 'Power%20On' : 'Power%20Off';
+                url = `http://${dispositivo.ip}/cm?cmnd=${cmdGen}`;
+        }
+
+        console.log(`[IOT ${dispositivo.nome}] Comando: ${comando} -> ${url}`);
+
+        http.get(url, { timeout: 5000 }, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                resolve({
+                    dispositivo_id: dispositivo.id,
+                    nome: dispositivo.nome,
+                    comando: comando,
+                    success: true,
+                    response: data
+                });
+            });
+        }).on('error', (e) => {
+            reject(e);
+        });
+    });
 }
 
-function sendStatusUpdate() {
+// Conectar ao WebSocket
+function connect() {
+    console.log(`\n[WS] Conectando a ${SERVER_URL}...`);
+    
+    ws = new WebSocket(SERVER_URL);
+
+    ws.on('open', () => {
+        console.log('[WS] Conectado!');
+        
+        // Autenticar
+        ws.send(JSON.stringify({
+            action: 'auth',
+            cliente_id: clienteId,
+            info: getSystemInfo()
+        }));
+    });
+
+    ws.on('message', async (data) => {
+        try {
+            const msg = JSON.parse(data.toString());
+            console.log('[WS] Mensagem:', msg.action || msg.type || 'desconhecido');
+
+            switch (msg.action) {
+                case 'auth_success':
+                    console.log('[WS] Autenticado com sucesso!');
+                    startSnapshotCapture();
+                    break;
+
+                case 'ping':
+                    ws.send(JSON.stringify({
+                        action: 'pong',
+                        cliente_id: clienteId,
+                        timestamp: Date.now(),
+                        info: getSystemInfo()
+                    }));
+                    break;
+
+                case 'get_status':
+                    ws.send(JSON.stringify({
+                        action: 'status',
+                        request_id: msg.request_id,
+                        cliente_id: clienteId,
+                        info: getSystemInfo(),
+                        cameras: cameras.map(c => ({ id: c.id, nome: c.nome, ip: c.ip, ativo: c.ativo })),
+                        dispositivos: dispositivos.map(d => ({ id: d.id, nome: d.nome, ip: d.ip, tipo: d.tipo }))
+                    }));
+                    break;
+
+                case 'add_camera':
+                    const newCam = {
+                        id: msg.camera.id || Date.now().toString(),
+                        nome: msg.camera.nome,
+                        ip: msg.camera.ip,
+                        porta: msg.camera.porta || 554,
+                        usuario: msg.camera.usuario || 'admin',
+                        senha: msg.camera.senha || 'admin',
+                        fabricante: msg.camera.fabricante,
+                        modelo: msg.camera.modelo,
+                        rtsp_url: msg.camera.rtsp_url,
+                        ativo: true
+                    };
+                    cameras.push(newCam);
+                    saveConfig();
+                    startSnapshotCapture();
+                    ws.send(JSON.stringify({
+                        action: 'camera_added',
+                        request_id: msg.request_id,
+                        camera: newCam,
+                        success: true
+                    }));
+                    console.log(`[CAM] Câmera adicionada: ${newCam.nome}`);
+                    break;
+
+                case 'remove_camera':
+                    cameras = cameras.filter(c => c.id !== msg.camera_id);
+                    if (snapshotIntervals[msg.camera_id]) {
+                        clearInterval(snapshotIntervals[msg.camera_id]);
+                        delete snapshotIntervals[msg.camera_id];
+                    }
+                    saveConfig();
+                    ws.send(JSON.stringify({
+                        action: 'camera_removed',
+                        request_id: msg.request_id,
+                        camera_id: msg.camera_id,
+                        success: true
+                    }));
+                    console.log(`[CAM] Câmera removida: ${msg.camera_id}`);
+                    break;
+
+                case 'add_dispositivo':
+                    const newDisp = {
+                        id: msg.dispositivo.id || Date.now().toString(),
+                        nome: msg.dispositivo.nome,
+                        ip: msg.dispositivo.ip,
+                        tipo: msg.dispositivo.tipo || 'sonoff',
+                        usuario: msg.dispositivo.usuario,
+                        senha: msg.dispositivo.senha
+                    };
+                    dispositivos.push(newDisp);
+                    saveConfig();
+                    ws.send(JSON.stringify({
+                        action: 'dispositivo_added',
+                        request_id: msg.request_id,
+                        dispositivo: newDisp,
+                        success: true
+                    }));
+                    console.log(`[IOT] Dispositivo adicionado: ${newDisp.nome}`);
+                    break;
+
+                case 'remove_dispositivo':
+                    dispositivos = dispositivos.filter(d => d.id !== msg.dispositivo_id);
+                    saveConfig();
+                    ws.send(JSON.stringify({
+                        action: 'dispositivo_removed',
+                        request_id: msg.request_id,
+                        dispositivo_id: msg.dispositivo_id,
+                        success: true
+                    }));
+                    console.log(`[IOT] Dispositivo removido: ${msg.dispositivo_id}`);
+                    break;
+
+                case 'control_dispositivo':
+                    try {
+                        const disp = dispositivos.find(d => d.id === msg.dispositivo_id);
+                        if (!disp) throw new Error('Dispositivo não encontrado');
+                        
+                        const result = await controlDevice(disp, msg.comando);
+                        ws.send(JSON.stringify({
+                            action: 'dispositivo_controlled',
+                            request_id: msg.request_id,
+                            ...result
+                        }));
+                    } catch (e) {
+                        ws.send(JSON.stringify({
+                            action: 'dispositivo_controlled',
+                            request_id: msg.request_id,
+                            dispositivo_id: msg.dispositivo_id,
+                            success: false,
+                            error: e.message
+                        }));
+                    }
+                    break;
+
+                case 'request_snapshot':
+                    const cam = cameras.find(c => c.id === msg.camera_id);
+                    if (cam) {
+                        captureAndSend(cam);
+                    }
+                    break;
+
+                case 'sync_config':
+                    // Sincroniza configuração do dashboard
+                    if (msg.cameras) {
+                        cameras = msg.cameras;
+                    }
+                    if (msg.dispositivos) {
+                        dispositivos = msg.dispositivos;
+                    }
+                    saveConfig();
+                    startSnapshotCapture();
+                    console.log('[SYNC] Configuração sincronizada');
+                    break;
+            }
+        } catch (e) {
+            console.error('[WS] Erro ao processar mensagem:', e.message);
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('[WS] Desconectado. Reconectando em 5s...');
+        setTimeout(connect, 5000);
+    });
+
+    ws.on('error', (err) => {
+        console.error('[WS] Erro:', err.message);
+    });
+}
+
+// Status periódico
+setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
             action: 'status_update',
-            cliente_id: config.cliente_id,
+            cliente_id: clienteId,
             info: getSystemInfo()
         }));
     }
-}
+}, 30000);
 
-// ========== COMANDOS ==========
-function handleMessage(message) {
-    switch (message.action) {
-        case 'auth_success':
-            log('Autenticação bem sucedida!');
-            break;
-            
-        case 'get_info':
-            sendResponse(message.request_id, { info: getSystemInfo() });
-            break;
-            
-        case 'get_cameras':
-            getCameras(message.request_id);
-            break;
-            
-        case 'exec':
-            executeCommand(message.command, message.request_id);
-            break;
-            
-        case 'ping':
-            sendResponse(message.request_id, { pong: true, timestamp: Date.now() });
-            break;
-            
-        default:
-            log(`Ação desconhecida: ${message.action}`);
-    }
-}
+// Inicialização
+console.log('========================================');
+console.log('   ATRITELECOM AGENT v2.0');
+console.log('   Suporte a Câmeras e IoT');
+console.log('========================================\n');
 
-function sendResponse(request_id, data) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-            request_id,
-            cliente_id: config.cliente_id,
-            ...data
-        }));
-    }
-}
-
-function executeCommand(command, request_id) {
-    log(`Executando comando: ${command}`);
-    
-    exec(command, { timeout: 30000 }, (error, stdout, stderr) => {
-        sendResponse(request_id, {
-            action: 'exec_result',
-            success: !error,
-            stdout: stdout,
-            stderr: stderr,
-            error: error ? error.message : null
-        });
+if (!loadConfig()) {
+    // Primeira execução - pedir cliente_id
+    const readline = require('readline');
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
     });
-}
 
-function getCameras(request_id) {
-    // Tenta encontrar câmeras via ARP/rede local
-    const command = process.platform === 'win32' 
-        ? 'arp -a' 
-        : 'arp -n';
-    
-    exec(command, (error, stdout, stderr) => {
-        sendResponse(request_id, {
-            action: 'cameras_result',
-            arp_table: stdout,
-            error: error ? error.message : null
-        });
-    });
-}
-
-// ========== INICIALIZAÇÃO ==========
-function init() {
-    log('========================================');
-    log('Atritelecom Agent v1.0.0');
-    log('========================================');
-    
-    // Verificar argumento de linha de comando para cliente_id
-    const args = process.argv.slice(2);
-    if (args[0]) {
-        config.cliente_id = args[0];
+    rl.question('Digite o ID do cliente: ', (answer) => {
+        clienteId = answer.trim();
         saveConfig();
-        log(`Cliente ID configurado via argumento: ${config.cliente_id}`);
-    } else {
-        loadConfig();
-    }
-    
-    if (!config.cliente_id) {
-        log('');
-        log('ERRO: Cliente ID não configurado!');
-        log('');
-        log('Use: agent.exe <cliente_id>');
-        log('Exemplo: agent.exe atritelecom');
-        log('');
-        
-        // No Windows, espera input
-        if (process.platform === 'win32') {
-            const readline = require('readline');
-            const rl = readline.createInterface({
-                input: process.stdin,
-                output: process.stdout
-            });
-            
-            rl.question('Digite o Cliente ID: ', (answer) => {
-                if (answer.trim()) {
-                    config.cliente_id = answer.trim();
-                    saveConfig();
-                    rl.close();
-                    connect();
-                } else {
-                    log('Cliente ID inválido. Saindo...');
-                    process.exit(1);
-                }
-            });
-        } else {
-            process.exit(1);
-        }
-    } else {
+        rl.close();
         connect();
-    }
+    });
+} else {
+    console.log(`Cliente: ${clienteId}`);
+    console.log(`Câmeras: ${cameras.length}`);
+    console.log(`Dispositivos: ${dispositivos.length}\n`);
+    connect();
 }
-
-// Tratar encerramento gracioso
-process.on('SIGINT', () => {
-    log('Encerrando...');
-    if (ws) ws.close();
-    process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-    log('Encerrando...');
-    if (ws) ws.close();
-    process.exit(0);
-});
-
-// Iniciar
-init();
